@@ -7,6 +7,7 @@ import json
 import numpy as np
 from transformers import AutoModel, AutoTokenizer
 from sklearn.cluster import MiniBatchKMeans
+from scipy.spatial.distance import cdist
 
 def generate_semantic_shuffle(model_name, split_num, save_path, softness=0.2, high_freq_ratio=0.2):
     print(f"Loading model: {model_name}...")
@@ -31,14 +32,47 @@ def generate_semantic_shuffle(model_name, split_num, save_path, softness=0.2, hi
     # 为了稳健，我们这里使用 Embedding 的 L2 Norm 作为一个简单的启发式特征（常用词往往 Norm 较稳定），
     # 但最稳健的“高频随机性”其实就是：随机选取 20% 的词作为“高频组”。
     
-    indices = np.arange(vocab_size)
-    np.random.shuffle(indices) # 先全打乱
+    # indices = np.arange(vocab_size)
+    # np.random.shuffle(indices) # 先全打乱
+    
+    # cutoff = int(vocab_size * high_freq_ratio)
+    # high_freq_indices = indices[:cutoff] # 这部分将保持完全随机 (High Entropy)
+    # semantic_indices = indices[cutoff:]  # 这部分将进行聚类 (Semantic Preservation)
+    
+    # print(f"Processing: {len(high_freq_indices)} random tokens, {len(semantic_indices)} semantic tokens.")
+
+
+
+    # ================= 修改开始 =================
+    # --- 1. 频率分层 (基于 Embedding Norm 的启发式策略) ---
+    print("Calculating Embedding Norms to estimate token frequency...")
+    
+    # 计算每个 Token Embedding 的 L2 范数 (模长)
+    # axis=1 表示对每个 (hidden_size,) 的向量计算范数
+    # 原理：高频词/功能词在训练中更新频繁，Embedding Norm 通常较小 (靠近原点)
+    norms = np.linalg.norm(embeddings, axis=1)
+    
+    # 对 Norm 进行从小到大排序，返回索引
+    # sorted_indices[0] 是 Norm 最小的词 (大概率是 "the", ",", "." 等)
+    sorted_indices = np.argsort(norms)
     
     cutoff = int(vocab_size * high_freq_ratio)
-    high_freq_indices = indices[:cutoff] # 这部分将保持完全随机 (High Entropy)
-    semantic_indices = indices[cutoff:]  # 这部分将进行聚类 (Semantic Preservation)
     
-    print(f"Processing: {len(high_freq_indices)} random tokens, {len(semantic_indices)} semantic tokens.")
+    # A. 选取 Norm 最小的前 N% 作为“高熵/高频组”
+    # 这些词虽然是被 Norm 选出来的，但在分配给 Channel 时需要保持“随机均匀性”
+    high_freq_indices = sorted_indices[:cutoff].copy()
+    
+    # [关键步骤] 必须对 high_freq_indices 内部进行一次打乱！
+    # 如果不打乱，Channel 0 会分到 Norm 极小的词，Channel k 会分到 Norm 稍大的词，导致通道间特征不平衡。
+    np.random.shuffle(high_freq_indices)
+    
+    # B. 剩余的 (Norm 较大的) 作为“语义组”，用于后续聚类
+    semantic_indices = sorted_indices[cutoff:].copy()
+    
+    print(f"Heuristic Partition: {len(high_freq_indices)} tokens (Low Norm) -> Random Shuffle")
+    print(f"                     {len(semantic_indices)} tokens (High Norm) -> Semantic Clustering")
+    # ================= 修改结束 =================
+    
 
     # --- 2. 语义聚类 (Mid/Low Frequency Layer) ---
     print("Clustering semantic tokens...")
@@ -83,62 +117,116 @@ def generate_semantic_shuffle(model_name, split_num, save_path, softness=0.2, hi
     # MCMark 的逻辑是：reshape(split_num, -1)。这意味着每个 bucket 的大小必须严格一致 (vocab_size // split_num)。
     # 但刚才的分配肯定是不均匀的。我们需要进行 "Rebalancing" (再平衡)。
     
-    flat_shuffle = []
+    # --- 4. 构建最终 Shuffle (基于语义最优传输方案) ---
+    print("Rebalancing buckets using Semantic-Optimal Strategy...")
+    
     target_len = vocab_size // split_num
-    
-    # 简单的再平衡策略：
-    # 多的溢出到全局池，少的从全局池补。
-    # 但为了保持语义，我们尽量只移动那些“高频/随机”的词，或者被迫移动语义词。
-    
+    final_buckets = [None] * split_num
     overflow_pool = []
-    final_buckets = [[] for _ in range(split_num)]
     
-    # 第一轮：收集溢出
+    # 辅助函数：获取一个 bucket 中所有 token 的 embeddings
+    def get_bucket_embeddings(bucket_indices):
+        return embeddings[bucket_indices]
+
+    # --- Phase 1: 处理溢出 (Pruning Overflows) ---
+    # 策略：保留最核心的语义词，把边缘词扔出去
     for i in range(split_num):
-        if len(channel_buckets[i]) > target_len:
-            # 截断，多余的放入池子 (优先截断后加入的，即语义词，这稍微有点损耗，但可以接受)
-            # 更好的做法是随机截断
-            np.random.shuffle(channel_buckets[i])
-            keep = channel_buckets[i][:target_len]
-            overflow = channel_buckets[i][target_len:]
-            final_buckets[i] = keep
-            overflow_pool.extend(overflow)
+        current_indices = channel_buckets[i]
+        current_len = len(current_indices)
+        
+        if current_len > target_len:
+            # 计算该通道的语义中心 (Centroid)
+            # 注意：如果 bucket 里大部分是随机分配的高频词，中心可能没意义，但这是目前最优解
+            bucket_embs = get_bucket_embeddings(current_indices)
+            centroid = np.mean(bucket_embs, axis=0, keepdims=True)
+            
+            # 计算每个词到中心的距离 (使用 Cosine Distance)
+            dists = cdist(bucket_embs, centroid, metric='cosine').squeeze()
+            
+            # 按距离排序 (从小到大)
+            sorted_arg = np.argsort(dists)
+            
+            # 保留最近的 target_len 个 (Keep the core semantics)
+            keep_arg = sorted_arg[:target_len]
+            overflow_arg = sorted_arg[target_len:]
+            
+            # 转换回原始 index
+            keep_indices = [current_indices[k] for k in keep_arg]
+            overflow_indices = [current_indices[k] for k in overflow_arg]
+            
+            final_buckets[i] = keep_indices
+            overflow_pool.extend(overflow_indices)
         else:
-            final_buckets[i] = channel_buckets[i] # 暂时保留，不够的后面补
-            
-    # 第二轮：填充不足
-    np.random.shuffle(overflow_pool)
-    pool_idx = 0
+            # 暂时不够，先不动，等下一轮填
+            final_buckets[i] = current_indices
+
+    print(f"Overflow pool size: {len(overflow_pool)}")
+
+    # --- Phase 2: 填充缺口 (Filling Underflows) ---
+    # 策略：从池子中选距离缺口通道中心最近的词填入
+    
+    # 先把 overflow_pool 转成 numpy 以便快速计算
+    if len(overflow_pool) > 0:
+        pool_indices = np.array(overflow_pool)
+        pool_embeddings = get_bucket_embeddings(pool_indices)
+        pool_mask = np.ones(len(pool_indices), dtype=bool) # 标记是否已被使用
     
     for i in range(split_num):
-        needed = target_len - len(final_buckets[i])
+        current_indices = final_buckets[i]
+        needed = target_len - len(current_indices)
+        
         if needed > 0:
-            if pool_idx + needed > len(overflow_pool):
-                # 极其罕见的情况：整除问题导致余数
-                # 简单的填充剩下的
-                fill = overflow_pool[pool_idx:]
+            if needed > np.sum(pool_mask):
+                print(f"Warning: Not enough tokens in pool for channel {i}!")
+                # 极其罕见，只能跳过或报错
+                break
+                
+            # 计算当前通道的语义中心
+            # 如果通道是空的(极其罕见)，就用全局中心或者随机选一个
+            if len(current_indices) > 0:
+                bucket_embs = get_bucket_embeddings(current_indices)
+                centroid = np.mean(bucket_embs, axis=0, keepdims=True)
             else:
-                fill = overflow_pool[pool_idx : pool_idx + needed]
-                pool_idx += needed
-            final_buckets[i].extend(fill)
+                centroid = np.mean(embeddings, axis=0, keepdims=True)
             
-    # 展平
+            # 只计算还没被用掉的 pool token 的距离
+            active_pool_idx = np.where(pool_mask)[0]
+            active_pool_embs = pool_embeddings[active_pool_idx]
+            
+            # 计算距离
+            dists = cdist(active_pool_embs, centroid, metric='cosine').squeeze()
+            
+            # 找最近的 needed 个
+            # 注意：这里是用 argpartition 或 argsort
+            if needed < len(dists):
+                nearest_arg_in_active = np.argpartition(dists, needed)[:needed]
+            else:
+                nearest_arg_in_active = np.arange(len(dists))
+                
+            # 获取在 pool_indices 中的真实索引
+            real_pool_indices_idx = active_pool_idx[nearest_arg_in_active]
+            
+            # 选出的 token ID
+            selected_tokens = pool_indices[real_pool_indices_idx].tolist()
+            
+            # 填入 bucket
+            final_buckets[i].extend(selected_tokens)
+            
+            # 从 pool 中标记为已用
+            pool_mask[real_pool_indices_idx] = False
+
+    # --- Phase 3: 最终组装 ---
     final_indices = []
     for bucket in final_buckets:
         final_indices.extend(bucket)
         
-    # 处理整除余数 (vocab_size % split_num != 0 的部分)
-    # MCMark 代码中处理了余数，通常是通过截断或特殊逻辑。
-    # 这里我们简单地把剩余的 overflow_pool 加到末尾，MCMark 会根据逻辑处理。
-    remaining = vocab_size - len(final_indices)
-    if remaining > 0:
-        print(f"Warning: {remaining} tokens remaining due to divisibility. Appending to end.")
-        # 找回还在 pool 里没用的
-        leftover = overflow_pool[pool_idx:]
-        # 如果还不够 (因为刚才的逻辑是按整除算的)，可能原本 vocab 就不能整除
-        # 此时只需补上原 indices 中缺失的即可 (但这太复杂)
-        # 简单方案：直接用 pool 剩下的
-        final_indices.extend(leftover)
+    # 处理无法整除的剩余部分 (如果有的话，直接加到末尾，和原逻辑一致)
+    # 检查 pool 里还有没有没用的
+    if len(overflow_pool) > 0:
+        remaining_in_pool = pool_indices[pool_mask].tolist()
+        if len(remaining_in_pool) > 0:
+             # 只有当 vocab_size % split_num != 0 时才会发生
+             final_indices.extend(remaining_in_pool)
 
     # 转为 Tensor
     shuffle_tensor = torch.tensor(final_indices, dtype=torch.long)
